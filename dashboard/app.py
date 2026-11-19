@@ -691,7 +691,7 @@ def load_wilcoxon():
 @st.cache_resource
 def train_live_models():
     if not os.path.exists(DATA_PATH):
-        return None, None
+        return None, None, None, None
 
     df = pd.read_csv(DATA_PATH)
     for c in ["Glucose", "BloodPressure", "SkinThickness", "Insulin", "BMI"]:
@@ -700,7 +700,7 @@ def train_live_models():
     X = df.drop(columns="Outcome")
     y = df["Outcome"]
 
-    # Pipeline 1: RandomForest with RandomUnderSampler
+    # Champion Pipeline 1: RandomForest with RandomUnderSampler
     rf_pipe = Pipeline([
         ("imp", SimpleImputer(strategy="median")),
         ("sc", StandardScaler()),
@@ -709,7 +709,15 @@ def train_live_models():
     ])
     rf_pipe.fit(X, y)
 
-    # Pipeline 2: Logistic Regression with ClassWeight='balanced'
+    # Baseline Pipeline 1: RandomForest unweighted (No Resampling)
+    rf_base = Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("sc", StandardScaler()),
+        ("clf", RandomForestClassifier(n_estimators=200, random_state=1000, n_jobs=-1)),
+    ])
+    rf_base.fit(X, y)
+
+    # Champion Pipeline 2: Logistic Regression with ClassWeight='balanced'
     lr_pipe = Pipeline([
         ("imp", SimpleImputer(strategy="median")),
         ("sc", StandardScaler()),
@@ -717,7 +725,15 @@ def train_live_models():
     ])
     lr_pipe.fit(X, y)
 
-    return rf_pipe, lr_pipe
+    # Baseline Pipeline 2: Logistic Regression standard unweighted
+    lr_base = Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("sc", StandardScaler()),
+        ("clf", LogisticRegression(max_iter=2000, class_weight=None, random_state=1000)),
+    ])
+    lr_base.fit(X, y)
+
+    return rf_pipe, lr_pipe, rf_base, lr_base
 
 
 # ----------------- PLOT THEME HELPER -----------------
@@ -940,6 +956,40 @@ def render_overview():
                 )
                 style_plotly(fig_recall)
                 st.plotly_chart(fig_recall, use_container_width=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # Executive Scaling Curves for Balanced Accuracy across Sample Scarcity
+        st.markdown('<div class="glass-card"><div class="card-title">📈 Balanced Accuracy Trajectory Across Sample Scarcity (N = 60 to 537)</div>', unsafe_allow_html=True)
+        st.markdown("<p style='color:#94A3B8; font-size:0.86rem; margin-top:-10px; margin-bottom:14px;'>Empirical performance curves showing resilience of each strategy as training sample size decreases to acute scarcity (N = 60).</p>", unsafe_allow_html=True)
+
+        c_rf_line, c_lr_line = st.columns(2, gap="medium")
+
+        for col_slot, model_name, model_label in [(c_rf_line, "RandomForest", "🌲 Random Forest (Ensemble)"), (c_lr_line, "LogReg", "📈 Logistic Regression (Linear)")]:
+            with col_slot:
+                m_summary = summary_mean[summary_mean["model"] == model_name]
+                fig_traj = go.Figure()
+                for meth in METHODS_ORDER:
+                    m_sub = m_summary[m_summary["method"] == meth].sort_values("train_size")
+                    is_champ = meth in ["RandomUnder", "ClassWeight"]
+                    fig_traj.add_trace(go.Scatter(
+                        x=m_sub["train_size"],
+                        y=m_sub["BA"],
+                        mode="lines+markers",
+                        name=meth,
+                        line=dict(color=METHOD_COLORS.get(meth, "#38BDF8"), width=3.2 if is_champ else 1.8),
+                        marker=dict(size=7),
+                        hovertemplate=f"<b>{meth}</b><br>Cohort Size (N): %{{x}}<br>Balanced Accuracy: %{{y:.3f}}<extra></extra>",
+                    ))
+                fig_traj.update_layout(
+                    title=dict(text=model_label, font=dict(size=14, color="#F8FAFC"), x=0.5),
+                    xaxis=dict(title="Training Cohort Size (N)", tickvals=[60, 120, 250, 537], ticktext=["N=60", "N=120", "N=250", "N=537"]),
+                    yaxis=dict(title="Balanced Accuracy", range=[0.58, 0.78]),
+                    height=320,
+                    legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center", font=dict(size=10)),
+                )
+                style_plotly(fig_traj)
+                st.plotly_chart(fig_traj, use_container_width=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1319,7 +1369,7 @@ def render_statistical_tests():
 # PAGE 5: LIVE PREDICTOR
 # =========================================================================
 def render_live_predictor():
-    rf_pipe, lr_pipe = train_live_models()
+    rf_pipe, lr_pipe, rf_base, lr_base = train_live_models()
     if rf_pipe is None or lr_pipe is None:
         st.error("Failed to load models for live prediction.")
         return
@@ -1327,27 +1377,80 @@ def render_live_predictor():
     st.sidebar.markdown('<div class="sidebar-brand"><h2>🩺 Clinical Engine</h2><p>Select diagnostic pipeline</p></div>', unsafe_allow_html=True)
     chosen_clf = st.sidebar.radio(
         "Classifier Engine",
-        ["Random Forest (Best Overall, RandomUnder)", "Logistic Regression (ClassWeight)"],
+        ["Random Forest (Champion: RandomUnder)", "Logistic Regression (Champion: ClassWeight)"],
     )
 
-    pipeline = rf_pipe if "Random Forest" in chosen_clf else lr_pipe
+    is_rf = "Random Forest" in chosen_clf
+    pipeline = rf_pipe if is_rf else lr_pipe
+    base_pipe = rf_base if is_rf else lr_base
 
     st.markdown('<div class="glass-card"><div class="card-title">🧪 Patient Clinical Biomarkers & Physical Measurements</div>', unsafe_allow_html=True)
+
+    # 1-Click Patient Presets
+    st.markdown("<p style='color:#94A3B8; font-size:0.86rem; margin-top:-8px; margin-bottom:12px;'>⚡ <b>Quick Clinical Encounter Presets:</b> Click any preset below to auto-populate patient biomarkers.</p>", unsafe_allow_html=True)
+    p_col1, p_col2, p_col3 = st.columns(3)
+
+    if "p_preg" not in st.session_state: st.session_state["p_preg"] = 3
+    if "p_gluc" not in st.session_state: st.session_state["p_gluc"] = 125
+    if "p_bp" not in st.session_state: st.session_state["p_bp"] = 72
+    if "p_skin" not in st.session_state: st.session_state["p_skin"] = 23
+    if "p_ins" not in st.session_state: st.session_state["p_ins"] = 35
+    if "p_bmi" not in st.session_state: st.session_state["p_bmi"] = 32.5
+    if "p_dpf" not in st.session_state: st.session_state["p_dpf"] = 0.45
+    if "p_age" not in st.session_state: st.session_state["p_age"] = 33
+
+    with p_col1:
+        if st.button("👤 Normal / Healthy Control", key="preset_healthy", use_container_width=True):
+            st.session_state["p_preg"] = 1
+            st.session_state["p_gluc"] = 88
+            st.session_state["p_bp"] = 66
+            st.session_state["p_skin"] = 18
+            st.session_state["p_ins"] = 30
+            st.session_state["p_bmi"] = 22.8
+            st.session_state["p_dpf"] = 0.22
+            st.session_state["p_age"] = 24
+            st.rerun()
+
+    with p_col2:
+        if st.button("👤 Borderline Metabolic Case", key="preset_borderline", use_container_width=True):
+            st.session_state["p_preg"] = 4
+            st.session_state["p_gluc"] = 132
+            st.session_state["p_bp"] = 76
+            st.session_state["p_skin"] = 28
+            st.session_state["p_ins"] = 85
+            st.session_state["p_bmi"] = 29.5
+            st.session_state["p_dpf"] = 0.54
+            st.session_state["p_age"] = 41
+            st.rerun()
+
+    with p_col3:
+        if st.button("👤 High-Risk Diabetic Encounter", key="preset_highrisk", use_container_width=True):
+            st.session_state["p_preg"] = 7
+            st.session_state["p_gluc"] = 176
+            st.session_state["p_bp"] = 88
+            st.session_state["p_skin"] = 42
+            st.session_state["p_ins"] = 220
+            st.session_state["p_bmi"] = 38.4
+            st.session_state["p_dpf"] = 1.15
+            st.session_state["p_age"] = 52
+            st.rerun()
+
+    st.write("")
     c1, c2 = st.columns(2, gap="large")
 
     with c1:
         st.markdown("##### 🧬 Physiological Vitals")
-        preg = st.slider("Pregnancies (Total Count)", 0, 17, 3, help="Number of full-term pregnancies")
-        glucose = st.slider("2-Hour Glucose Concentration (mg/dL)", 40, 200, 125, help="Fasting oral glucose tolerance test")
-        bp = st.slider("Diastolic Blood Pressure (mm Hg)", 40, 130, 72, help="Resting diastolic arterial pressure")
-        skin = st.slider("Triceps Skinfold Thickness (mm)", 7, 99, 23, help="Subcutaneous adipose tissue thickness")
+        preg = st.slider("Pregnancies (Total Count)", 0, 17, int(st.session_state["p_preg"]), key="sl_preg")
+        glucose = st.slider("2-Hour Glucose Concentration (mg/dL)", 40, 200, int(st.session_state["p_gluc"]), key="sl_gluc")
+        bp = st.slider("Diastolic Blood Pressure (mm Hg)", 40, 130, int(st.session_state["p_bp"]), key="sl_bp")
+        skin = st.slider("Triceps Skinfold Thickness (mm)", 7, 99, int(st.session_state["p_skin"]), key="sl_skin")
 
     with c2:
         st.markdown("##### 🩸 Metabolic Biomarkers & History")
-        insulin = st.slider("2-Hour Serum Insulin (mu U/ml)", 14, 846, 35, help="Serum insulin concentration")
-        bmi = st.slider("Body Mass Index (BMI, kg/m²)", 15.0, 67.0, 32.5, step=0.1, help="Body weight / height squared")
-        dpf = st.slider("Diabetes Pedigree Function (Genetic)", 0.05, 2.50, 0.45, step=0.01, help="Familial diabetes history index")
-        age = st.slider("Patient Age (Years)", 21, 85, 33, help="Chronological age")
+        insulin = st.slider("2-Hour Serum Insulin (mu U/ml)", 14, 846, int(st.session_state["p_ins"]), key="sl_ins")
+        bmi = st.slider("Body Mass Index (BMI, kg/m²)", 15.0, 67.0, float(st.session_state["p_bmi"]), step=0.1, key="sl_bmi")
+        dpf = st.slider("Diabetes Pedigree Function (Genetic)", 0.05, 2.50, float(st.session_state["p_dpf"]), step=0.01, key="sl_dpf")
+        age = st.slider("Patient Age (Years)", 21, 85, int(st.session_state["p_age"]), key="sl_age")
 
     input_data = pd.DataFrame([{
         "Pregnancies": preg,
@@ -1369,10 +1472,13 @@ def render_live_predictor():
         prob_diabetes = probs[1]
         pct_diabetes = prob_diabetes * 100
 
+        base_probs = base_pipe.predict_proba(input_data)[0]
+        base_pct = base_probs[1] * 100
+
         col_gauge, col_result = st.columns([1.2, 1.1], gap="large")
 
         with col_gauge:
-            st.markdown('<div class="glass-card"><div class="card-title">⏱️ Predicted Risk Trajectory</div>', unsafe_allow_html=True)
+            st.markdown('<div class="glass-card"><div class="card-title">⏱️ Calibrated Risk Trajectory (Champion Model)</div>', unsafe_allow_html=True)
             fig_gauge = go.Figure(go.Indicator(
                 mode="gauge+number",
                 value=pct_diabetes,
@@ -1403,24 +1509,48 @@ def render_live_predictor():
         with col_result:
             if prob_diabetes >= 0.50:
                 st.markdown(f"""
-                <div class="risk-card high">
-                    <span class="risk-badge high">⚠️ High Diagnostic Risk</span>
-                    <h2 style="color: #F8FAFC; margin: 0 0 8px 0; font-size: 1.8rem; font-weight: 800;">{pct_diabetes:.1f}% Probability</h2>
-                    <p style="color: #CBD5E1; font-size: 0.95rem; line-height: 1.5; margin: 0;">
-                        The model classifies this encounter in the <b>high-risk diabetes stratum</b>. Major driving covariates include elevated glucose concentration ({glucose} mg/dL) and elevated BMI ({bmi:.1f} kg/m²).
+                <div class="risk-card high" style="background: linear-gradient(135deg, rgba(244, 63, 94, 0.18) 0%, rgba(15, 23, 42, 0.95) 100%); border: 1px solid rgba(244, 63, 94, 0.45); border-radius: 14px; padding: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.3);">
+                    <span class="risk-badge high" style="background: rgba(244, 63, 94, 0.2); color: #FDA4AF; border: 1px solid rgba(244, 63, 94, 0.4); padding: 4px 12px; border-radius: 20px; font-size: 0.76rem; font-weight: 700; text-transform: uppercase;">⚠️ High Diagnostic Risk</span>
+                    <h2 style="color: #F8FAFC; margin: 12px 0 8px 0; font-size: 2rem; font-weight: 800;">{pct_diabetes:.1f}% Probability</h2>
+                    <p style="color: #CBD5E1; font-size: 0.92rem; line-height: 1.55; margin: 0;">
+                        The model classifies this encounter in the <b>high-risk diabetes stratum</b>. Driving clinical indicators include oral glucose concentration ({glucose} mg/dL) and body mass index ({bmi:.1f} kg/m²).
                     </p>
                 </div>
                 """, unsafe_allow_html=True)
             else:
                 st.markdown(f"""
-                <div class="risk-card low">
-                    <span class="risk-badge low">✅ Low Diagnostic Risk</span>
-                    <h2 style="color: #F8FAFC; margin: 0 0 8px 0; font-size: 1.8rem; font-weight: 800;">{pct_diabetes:.1f}% Probability</h2>
-                    <p style="color: #CBD5E1; font-size: 0.95rem; line-height: 1.5; margin: 0;">
+                <div class="risk-card low" style="background: linear-gradient(135deg, rgba(16, 185, 129, 0.18) 0%, rgba(15, 23, 42, 0.95) 100%); border: 1px solid rgba(16, 185, 129, 0.45); border-radius: 14px; padding: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.3);">
+                    <span class="risk-badge low" style="background: rgba(16, 185, 129, 0.2); color: #34D399; border: 1px solid rgba(16, 185, 129, 0.4); padding: 4px 12px; border-radius: 20px; font-size: 0.76rem; font-weight: 700; text-transform: uppercase;">✅ Low Diagnostic Risk</span>
+                    <h2 style="color: #F8FAFC; margin: 12px 0 8px 0; font-size: 2rem; font-weight: 800;">{pct_diabetes:.1f}% Probability</h2>
+                    <p style="color: #CBD5E1; font-size: 0.92rem; line-height: 1.55; margin: 0;">
                         The model classifies this encounter in the <b>low-risk stratum</b>. Fasting glucose, insulin, and BMI remain aligned with the normoglycemic cohort distribution.
                     </p>
                 </div>
                 """, unsafe_allow_html=True)
+
+        # Baseline vs Champion Comparison Section
+        st.markdown(f"""
+        <div style="background: #131B2E; border: 1px solid rgba(148, 163, 184, 0.16); border-radius: 14px; padding: 22px; margin-top: 18px; box-shadow: 0 6px 20px rgba(0,0,0,0.25);">
+            <div style="font-size: 1.05rem; font-weight: 700; color: #F8FAFC; margin-bottom: 14px; display: flex; align-items: center; gap: 8px;">
+                <span>⚖️ Clinical Decision Comparison: Champion Strategy vs. Unweighted Baseline</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 10px; padding: 16px;">
+                    <div style="font-size: 0.76rem; color: #38BDF8; font-weight: 700; text-transform: uppercase; margin-bottom: 4px;">Champion Model (With Resampling)</div>
+                    <div style="font-size: 1.6rem; font-weight: 800; color: #F8FAFC;">{pct_diabetes:.1f}%</div>
+                    <div style="font-size: 0.8rem; color: #94A3B8; margin-top: 4px;">Classification: <b style="color: {'#F43F5E' if prob_diabetes >= 0.5 else '#34D399'};">{'Positive (Diabetic)' if prob_diabetes >= 0.5 else 'Negative (Non-Diabetic)'}</b></div>
+                </div>
+                <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(148, 163, 184, 0.16); border-radius: 10px; padding: 16px;">
+                    <div style="font-size: 0.76rem; color: #94A3B8; font-weight: 700; text-transform: uppercase; margin-bottom: 4px;">Standard Baseline (No Resampling)</div>
+                    <div style="font-size: 1.6rem; font-weight: 800; color: #94A3B8;">{base_pct:.1f}%</div>
+                    <div style="font-size: 0.8rem; color: #64748B; margin-top: 4px;">Classification: <b style="color: {'#F43F5E' if base_probs[1] >= 0.5 else '#94A3B8'};">{'Positive (Diabetic)' if base_probs[1] >= 0.5 else 'Negative (Non-Diabetic)'}</b></div>
+                </div>
+            </div>
+            <p style="color: #94A3B8; font-size: 0.84rem; line-height: 1.5; margin: 14px 0 0 0;">
+                💡 <b>Clinical Finding:</b> Unweighted models trained on imbalanced medical cohorts frequently suppress minority probabilities toward zero due to majority class dominance (65.1% negative). Algorithmic cost-weighting and under-sampling recalibrate the decision threshold to protect against life-threatening false negatives.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("""
     <div class="disclaimer-box">
